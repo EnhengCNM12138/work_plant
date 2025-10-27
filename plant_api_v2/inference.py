@@ -524,141 +524,137 @@ def download_image(url: str, temp_dir: str = "uploads") -> str:
         return None
 
 def predict_plant_full(image_paths: List[str]) -> Dict:
-    """完整的植物识别流程，输出格式与plant_api一致"""
+    """完整的植物识别流程，输出逻辑与 plant_api/inference.py 对齐（不改动路由与分类器）。"""
     try:
-        print(f"🔍 开始处理 {len(image_paths)} 张图像...")
-        
-        # 1. 植物检测
-        valid_paths = []
-        for i, path in enumerate(image_paths):
-            print(f"📷 处理图像 {i+1}/{len(image_paths)}")
-            
-            if not os.path.exists(path):
-                print(f"❌ 文件不存在: {path}")
-                continue
-            
-            if os.path.isdir(path):
-                print(f"❌ 路径是目录: {path}")
-                continue
-            
-            # 植物检测
-            try:
-                is_plant = is_plant_clip(path)
-                if not is_plant:
-                    print(f"❌ 不是植物")
-                    continue
-            except Exception as e:
-                print(f"⚠️ 植物检测失败: {e}")
-                continue
-            
-            valid_paths.append(path)
-            print(f"✅ 植物检测通过")
-        
-        if not valid_paths:
+        # 输入标准化与批量上限（与 v1 对齐）
+        if isinstance(image_paths, (str, Path)):
+            image_paths = [str(image_paths)]
+        if not image_paths:
+            return {"code": 400, "msg": "错误：输入图像列表为空", "data": {}}
+
+        max_batch = 3
+        image_paths = image_paths[:max_batch]
+
+        # 拒识策略阈值（与 v1 保持一致的默认值）
+        prob_threshold = 0.42
+        ent_threshold = 1.5
+
+        # 1) 植物性检测（多数规则）
+        is_plant_flags = [is_plant_clip(p) for p in image_paths]
+        num_plant = sum(is_plant_flags)
+        if num_plant <= (len(image_paths) // 2):
             return {
-                "code": 404,
-                "msg": "没有成功识别的植物图像",
-                "data": {}
+                "code": 200, "msg": "成功",
+                "data": {"is_plant": False, "is_database": False, "plants": [], "is_infected": False}
             }
-        
-        print(f"🌿 成功识别 {len(valid_paths)} 张植物图像")
-        
-        # 2. 物种识别（软路由）
-        try:
-            infer_out = predict_species_for_batch_images_soft(
-                valid_paths,
-                organ_topk=2,
-                tau_min=0.10,
-                alpha_sharpen=1.5
-            )
-            
-            # 处理结果
-            results = []
-            for i, detail in enumerate(infer_out["details"]):
-                if detail["final_species"] is not None:
-                    # 构建候选列表
-                    candidates = []
-                    for species, conf in detail["top3"]:
-                        candidates.append({
-                            "latin_name": species,
-                            "confidence": conf
-                        })
-                    
-                    results.append({
-                        "path": detail["image"],
-                        "image_index": i + 1,
-                        "organ": detail["organ_top1"],
-                        "species": detail["final_species"],
-                        "confidence": detail["final_conf"],
-                        "candidates": candidates
-                    })
-            
-            if not results:
-                return {
-                    "code": 404,
-                    "msg": "没有成功识别的植物图像",
-                    "data": {}
+
+        # 仅对判为植物的图片进行物种识别
+        valid_paths = [p for p, f in zip(image_paths, is_plant_flags) if f]
+
+        # 2) 物种识别（软路由不改动）
+        infer_out = predict_species_for_batch_images_soft(
+            valid_paths,
+            organ_topk=2,
+            tau_min=0.10,
+            alpha_sharpen=1.5
+        )
+
+        # 3) 基于阈值的拒识与多图统计（对齐 v1 行为）
+        known_results = []  # 可用预测（通过拒识）
+        all_top1_species = []
+        species_to_scores = {}
+        species_to_images = {}
+
+        details = infer_out.get("details", [])
+        for path, detail in zip(valid_paths, details):
+            final_species = detail.get("final_species")
+            final_conf = float(detail.get("final_conf", 0.0))
+            top3_pairs = detail.get("top3", [])  # [(latin_name, prob), ...]
+
+            if final_species is None:
+                all_top1_species.append("unknown")
+                continue
+
+            # 近似熵：使用 top3 + 剩余质量作为一类
+            sum_top3 = float(sum(v for _, v in top3_pairs))
+            probs_for_entropy = [float(v) for _, v in top3_pairs]
+            rest_mass = max(1.0 - sum_top3, 0.0)
+            if rest_mass > 0:
+                probs_for_entropy.append(rest_mass)
+            p = np.array(probs_for_entropy, dtype=np.float32)
+            p = p / (float(p.sum()) + 1e-12)
+            ent = float(-(p * np.log(p + 1e-12)).sum())
+
+            # 拒识：低置信或高熵 → 认为是库外
+            if (final_conf < prob_threshold) or (ent > ent_threshold):
+                all_top1_species.append("unknown")
+                continue
+
+            candidates = [{"latin_name": s, "confidence": round(float(v), 4)} for s, v in top3_pairs]
+
+            all_top1_species.append(final_species)
+            known_results.append({
+                "path": path,
+                "species": final_species,
+                "confidence": round(final_conf, 4),
+                "candidates": candidates,
+            })
+            species_to_scores.setdefault(final_species, []).append(final_conf)
+            species_to_images.setdefault(final_species, []).append(path)
+
+        # 若无任何可识别结果
+        if not known_results:
+            return {
+                "code": 200, "msg": "成功",
+                "data": {"is_plant": True, "is_database": False, "plants": [], "is_infected": False}
+            }
+
+        # 单图：直接返回 TopK 候选 + 病虫害
+        if len(image_paths) == 1:
+            r = known_results[0]
+            is_infected = is_diseased_clip([r["path"]], vote_threshold=0.5)
+            return {
+                "code": 200, "msg": "成功",
+                "data": {
+                    "is_plant": True,
+                    "is_database": True,
+                    "plants": r["candidates"],
+                    "is_infected": bool(is_infected)
                 }
-            
-            # 3. 病虫害检测
-            is_infected = False
-            if valid_paths:
-                try:
-                    is_infected = is_diseased_clip(valid_paths, vote_threshold=0.7)
-                except Exception as e:
-                    print(f"⚠️ 病虫害检测失败: {e}")
-            
-            # 4. 构建最终结果（与plant_api格式一致）
-            if len(results) == 1:
-                # 单张图片
-                result = results[0]
-                return {
-                    "code": 200,
-                    "msg": "识别成功",
-                    "data": {
-                        "is_plant": True,
-                        "is_database": True,
-                        "plants": result["candidates"],
-                        "is_infected": bool(is_infected)
-                    }
-                }
+            }
+
+        # 多图：投票 + 平均置信度
+        counter = collections.Counter([s for s in all_top1_species if s != "unknown"])
+        if not counter:
+            return {
+                "code": 200, "msg": "成功",
+                "data": {"is_plant": True, "is_database": False, "plants": [], "is_infected": False}
+            }
+
+        top3 = counter.most_common(3)
+        plants_list = []
+        for name, votes in top3:
+            scores = species_to_scores.get(name, [])
+            if scores:
+                conf = round(float(sum(scores) / len(scores)), 4)
             else:
-                # 多张图片 - 投票机制
-                from collections import Counter
-                species_votes = Counter([r["species"] for r in results])
-                top3_species = species_votes.most_common(3)
-                
-                plants_list = []
-                for species, votes in top3_species:
-                    # 计算平均置信度
-                    confidences = [r["confidence"] for r in results if r["species"] == species]
-                    avg_conf = sum(confidences) / len(confidences) if confidences else votes / len(results) * 0.8
-                    plants_list.append({
-                        "latin_name": species,
-                        "confidence": round(avg_conf, 4)
-                    })
-                
-                return {
-                    "code": 200,
-                    "msg": "识别成功",
-                    "data": {
-                        "is_plant": True,
-                        "is_database": True,
-                        "plants": plants_list,
-                        "is_infected": bool(is_infected)
-                    }
-                }
-        
-        except Exception as e:
-            print(f"❌ 物种识别失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return {
-                "code": 500,
-                "msg": f"物种识别失败: {str(e)}",
-                "data": {}
+                conf = round(votes / len(all_top1_species) * 0.8, 4)
+            plants_list.append({"latin_name": name, "confidence": conf})
+
+        top1_species = top3[0][0]
+        disease_paths = species_to_images.get(top1_species, [])
+        is_infected = is_diseased_clip(disease_paths, vote_threshold=0.5)
+
+        return {
+            "code": 200, "msg": "成功",
+            "data": {
+                "is_plant": True,
+                "is_database": True,
+                "plants": plants_list,
+                "is_infected": bool(is_infected)
             }
-    
+        }
+
     except Exception as e:
         print(f"❌ 处理失败: {e}")
         import traceback
