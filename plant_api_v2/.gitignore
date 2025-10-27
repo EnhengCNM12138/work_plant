@@ -1,0 +1,54 @@
+# ===========================================
+# Plant API v2 项目专用 .gitignore
+# 目的：只提交代码与配置，不上传模型权重、索引、大文件
+# ===========================================
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb_checkpoints/
+
+# ---------- 环境与虚拟环境 ----------
+.env
+.venv/
+venv/
+env/
+
+# ---------- IDE & 系统文件 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---------- 模型权重与索引 ----------
+weights/*.pth
+weights/*.pt
+weights/*.npy
+weights/*.index
+weights/*.bin
+weights/ViT-L-14.pt
+weights/clip_index_*/
+weights/clip_index_top997/
+weights/*.log
+weights/*.tar
+weights/*.ckpt
+
+# ---------- 输出与日志 ----------
+outputs/
+logs/
+*.log
+*.tmp
+*.bak
+
+# ---------- 上传目录 ----------
+uploads/*
+!uploads/.gitkeep   # 保留空目录占位
+
+# ---------- Docker & 环境缓存 ----------
+*.pid
+*.sock
+*.db
+*.sqlite
+*.db-journal
