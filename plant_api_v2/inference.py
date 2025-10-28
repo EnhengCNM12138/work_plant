@@ -133,9 +133,8 @@ def load_clip_model():
     
     if clip_model is None:
         print("🔄 加载CLIP模型...")
-        clip_model, _, preprocess = open_clip.create_model_and_transforms(
-            'ViT-L-14', pretrained='openai'
-        )
+        clip_model, _, preprocess = open_clip.create_model_and_transforms("ViT-L-14", pretrained=None)
+        clip_model.load_state_dict(torch.load('weights/ViT-L-14.pt', map_location=DEVICE))
         clip_model = clip_model.to(DEVICE).eval()
         print("✅ CLIP模型加载完成")
 
