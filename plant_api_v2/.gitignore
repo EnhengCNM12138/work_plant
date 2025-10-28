@@ -23,12 +23,12 @@ env/
 Thumbs.db
 
 # ---------- 模型权重与索引 ----------
-weights/*.pth
-weights/*.pt
+#weights/*.pth
+#weights/*.pt
 weights/*.npy
 weights/*.index
 weights/*.bin
-weights/ViT-L-14.pt
+#weights/ViT-L-14.pt
 weights/clip_index_*/
 weights/clip_index_top997/
 weights/*.log
