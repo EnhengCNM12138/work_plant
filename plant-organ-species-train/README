@@ -1,0 +1,75 @@
+## plant-organ-species-train 使用说明
+
+### 执行顺序（推荐）
+1) 生成 CSV（仅需改图片根与输出 CSV 名）
+```bash
+python /mnt/e/code/plants-classification-conda/plant-organ-species-train/src/index_images.py \
+  --plant-dir /data/plants/BR \
+  --out-csv /data/csv/plant_BR.csv \
+  --country BR
+```
+
+2) Step0：生成映射与分割所需产物（带国家缩写）
+```bash
+python /mnt/e/code/plants-classification-conda/plant-organ-species-train/src/step0_and_organ.py step0 \
+  --csv /data/csv/plant_BR.csv \
+  --out /mnt/z/new_plants/model \
+  --country BR
+```
+
+3) 训练器官分类器（保存 organ_classification_{CC}_mybest.pth）
+```bash
+python /mnt/e/code/plants-classification-conda/plant-organ-species-train/src/step0_and_organ.py train-organ \
+  --csv /data/csv/plant_BR.csv \
+  --out /mnt/z/new_plants/model \
+  --country BR \
+  --data-root /
+```
+
+4) 训练各器官种类分类器（保存到 species_new/new_{organ}_species_model_{CC}.pth）
+```bash
+python /mnt/e/code/plants-classification-conda/plant-organ-species-train/src/train_species.py \
+  --csv /data/csv/plant_BR.csv \
+  --out /mnt/z/new_plants/model \
+  --country BR \
+  --data-root /
+```
+
+### 参数说明（统一规范）
+- index_images.py
+  - --plant-dir: 植物图片根目录（label 为子目录名）
+  - --out-csv: 输出 CSV 路径
+  - --country: 国家缩写（如 BR、CN）
+
+- step0_and_organ.py step0
+  - --csv: 第一步生成的 CSV
+  - --out: 输出根目录
+  - --country: 国家缩写（如 BR、CN）
+
+- step0_and_organ.py train-organ
+  - --csv: 同上 CSV
+  - --out: 输出根目录
+  - --country: 国家缩写（如 BR、CN）
+  - --data-root: 若 CSV 中 image_path 为相对路径，提供数据根；绝对路径则保持 "/"
+
+- train_species.py
+  - --csv: 同上 CSV
+  - --out: 输出根目录
+  - --country: 国家缩写（如 BR、CN）
+  - --data-root: 与上同
+
+### CSV 列规范
+index_images.py 生成标准列：
+- image_path, organ, organ_id, label, species
+
+### 输出与命名规范
+- 所有产物集中到：`<out>/<CC>_organ_species_model/`
+- Step0：
+  - `<CC>_organ_classes.json`
+  - 每器官：`<CC>_species_local_map_{organ}.json`, `<CC>_species_global2local_{organ}.json`, `<CC>_species_local2global_{organ}.json`
+- 器官分类器：
+  - `organ_classification_{CC}_mybest.pth`, `organ_classification_{CC}_last.pth`
+- 各器官种类分类器：
+  - `species_new/new_{organ}_species_model_{CC}.pth`
+
+以上仅做路径与命名参数化改造，算法/模型/超参/切分流程保持不变。

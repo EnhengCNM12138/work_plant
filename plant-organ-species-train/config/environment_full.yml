@@ -1,0 +1,11 @@
+name: plant310
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - notebook
+  - jupyter
+  - pytorch
+  - torchaudio
+  - pytorch-cuda=12.1
+  - torchvision
