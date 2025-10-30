@@ -55,6 +55,7 @@ from sklearn.metrics import f1_score, balanced_accuracy_score, confusion_matrix,
 import timm
 from tqdm import tqdm
 from timm.utils import ModelEmaV2
+from torch.cuda.amp import autocast, GradScaler
 
 # 记录每个器官的验证变换（评估/训练口径严格对齐）
 TRAIN_TF_REGISTRY = {}
@@ -86,7 +87,7 @@ def build_new_species_maps_for_organ(df: pd.DataFrame, organ: str,
 
     # 每物种（全局 species_id）在该器官下的样本数
     cnt = sub.groupby(col_gid)[col_gid].transform("count")
-    sub = sub[cnt >= 2].copy()  # 只保留 >=2 的物种（确保可切分 train & val）
+    sub = sub[cnt >= 10].copy()  # 只保留 >=2 的物种（确保可切分 train & val）
 
     # 若清理后为空或仅 1 类，则直接返回空映射
     uniq = sub[[col_label, col_gid]].drop_duplicates().sort_values([col_gid, col_label]).reset_index(drop=True)
@@ -563,6 +564,8 @@ def train_one_species_model_for_organ(
     mixup_alpha: float = 0.2,
     use_ema: bool = True,
     ema_m: float = 0.999,
+    resume: bool = True,
+    use_amp: bool = True,
 ):
     # —— 保持你原有的器官自适应配置、骨干与评估逻辑不变 —— 
     global current_organ
@@ -585,6 +588,11 @@ def train_one_species_model_for_organ(
     # 模型 & 变换（沿用你已有的 get_backbone_for_organ，注意它会注册 VAL_TF）
     model, tf_pair, img_size = get_backbone_for_organ(organ, num_classes)
     train_tf, val_tf = tf_pair
+
+    # Checkpoint 目录（每器官独立）
+    ckpt_dir = OUT_DIR / "checkpoints" / organ
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    last_state_path = ckpt_dir / "last_state.pt"
 
     # ★★★ 关键改动2：使用 NEW 的切分逻辑，保证 train/val 全覆盖
     tr_df, te_df = _load_fixed_split_or_fallback_NEW(
@@ -679,7 +687,7 @@ def train_one_species_model_for_organ(
     if organ == "flower":
         for p in model.classifier[2].parameters(): p.requires_grad = True
     elif organ == "leaf":
-        for p in model.fc.parameters(): p.requires_grad = True
+        for p in model.classifier[2].parameters(): p.requires_grad = True
     elif organ == "fruit":
         for p in model.classifier[1].parameters(): p.requires_grad = True
     elif organ == "bark":
@@ -715,8 +723,9 @@ def train_one_species_model_for_organ(
         for x, y, _ in tqdm(warmup_loader, total=len(warmup_loader), desc=f"[{organ}] Warmup {ep+1}/{epochs_head}"):
             if x.numel() == 0: continue
             x, y = x.to(DEVICE), y.to(DEVICE)
-            logits = model(x)
-            loss = crit_warmup(logits, y)
+            with autocast(enabled=use_amp):
+                logits = model(x)
+                loss = crit_warmup(logits, y)
             opt_head.zero_grad(); loss.backward(); opt_head.step()
             correct += (logits.argmax(1) == y).sum().item(); total += y.size(0)
         print(f"[{organ}] Warmup {ep+1}/{epochs_head} | Train Acc: {correct/max(1,total):.4f}")
@@ -805,7 +814,30 @@ def train_one_species_model_for_organ(
     best_top1  = -1.0
     bad = 0
 
-    for ep in range(epochs_ft):
+    # AMP Scaler
+    scaler = GradScaler(enabled=use_amp)
+
+    # 断点恢复（仅在微调阶段恢复）
+    start_ep = 0
+    if resume and last_state_path.exists():
+        try:
+            state = torch.load(last_state_path, map_location="cpu")
+            model.load_state_dict(state.get("model_state", {}), strict=False)
+            if use_ema and state.get("ema_model_state") is not None:
+                ema_model.load_state_dict(state["ema_model_state"], strict=False)
+            opt_ft.load_state_dict(state.get("optimizer_state", {}))
+            scheduler_cos.load_state_dict(state.get("scheduler_state", {}))
+            if scaler is not None and state.get("scaler_state") is not None:
+                scaler.load_state_dict(state["scaler_state"])
+            start_ep = int(state.get("epoch", -1)) + 1
+            best_top1 = float(state.get("best_top1", -1.0))
+            if state.get("best_state") is not None:
+                best_state = state["best_state"]
+            print(f"[{organ}] 恢复训练：从 epoch {start_ep} 继续（best_top1={best_top1:.4f}）")
+        except Exception as e:
+            print(f"[{organ}] 恢复失败，重新开始微调：{e}")
+
+    for ep in range(start_ep, epochs_ft):
         model.train()
         total, correct = 0, 0
         for x, y, _ in tqdm(tr_ld, total=len(tr_ld), desc=f"[{organ}] Finetune {ep+1}/{epochs_ft}"):
@@ -813,12 +845,20 @@ def train_one_species_model_for_organ(
             x, y = x.to(DEVICE), y.to(DEVICE)
             if use_mixup:
                 x, (ya, yb), lam = mixup_data(x, y, alpha=mixup_alpha)
-                logits = model(x)
-                loss = mixup_criterion(crit, logits, (ya, yb), lam)
+                with autocast(enabled=use_amp):
+                    logits = model(x)
+                    loss = mixup_criterion(crit, logits, (ya, yb), lam)
             else:
-                logits = model(x)
-                loss = crit(logits, y)
-            opt_ft.zero_grad(); loss.backward(); opt_ft.step()
+                with autocast(enabled=use_amp):
+                    logits = model(x)
+                    loss = crit(logits, y)
+            opt_ft.zero_grad()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(opt_ft)
+                scaler.update()
+            else:
+                loss.backward(); opt_ft.step()
             if use_ema:
                 with torch.no_grad():
                     for p_e, p in zip(ema_model.parameters(), model.parameters()):
@@ -861,6 +901,24 @@ def train_one_species_model_for_organ(
             if bad >= early_stop_patience:
                 print(f"[{organ}] Early stopping at epoch {ep+1}.")
                 break
+
+        # 保存断点（last_state）
+        try:
+            save_obj = {
+                "epoch": ep,
+                "model_state": model.state_dict(),
+                "ema_model_state": (ema_model.state_dict() if use_ema else None),
+                "optimizer_state": opt_ft.state_dict(),
+                "scheduler_state": scheduler_cos.state_dict(),
+                "scaler_state": (scaler.state_dict() if use_amp else None),
+                "best_top1": best_top1,
+                "best_state": best_state,
+                "organ": organ,
+                "country": COUNTRY,
+            }
+            torch.save(save_obj, last_state_path)
+        except Exception as e:
+            print(f"[{organ}] 保存断点失败：{e}")
 
     # 载入 BEST，最终验证一次并保存
     if best_state is not None:
@@ -920,7 +978,8 @@ def _country_dir(base_out: Path, country: str) -> Path:
     return Path(base_out) / f"{cc}_organ_species_model"
 
 
-def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str = "/"):
+def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str = "/", organs: List[str] = None,
+                     global_bs: int = None, global_num_workers: int = None, resume: bool = True, use_amp: bool = True):
     global OUT_DIR, SPECIES_NEW_DIR, DEVICE, COUNTRY, df
     COUNTRY = country
     OUT_DIR = _country_dir(Path(base_out), country)
@@ -936,7 +995,10 @@ def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str 
         f"CSV 至少需要列: {COL_IMAGE}, {COL_ORGAN_TXT}, {COL_LABEL}, {COL_SPECIESID}"
 
     # 按器官训练
-    for organ in ["bark","flower","fruit","leaf"]:
+    organ_list = organs if organs is not None and len(organs) > 0 else ["bark","flower","fruit","leaf"]
+    # 默认并行加载线程
+    num_workers = 2
+    for organ in organ_list:
         sub = df[df[COL_ORGAN_TXT] == organ]
         uniq_species = sub[COL_SPECIESID].nunique()
         if len(sub) < 50 or uniq_species < 10:    ####应该是能够提升准确率，如果不行，就还是2 or 4
@@ -952,6 +1014,11 @@ def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str 
         elif organ == "bark":
             bs = 40; base_lr_ft_head=1e-3; base_lr_ft_backbone = 5e-5;use_balanced_sampler= True ; freeze_bn = True
 
+        if global_bs is not None:
+            bs = global_bs
+        if global_num_workers is not None:
+            num_workers = global_num_workers
+
         print(f"\n🎯 训练器官 [{organ}] —— 样本={len(sub)}, 物种={uniq_species}")
         train_one_species_model_for_organ(
             df=df,
@@ -962,11 +1029,13 @@ def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str 
             base_lr_head=1e-3,
             base_lr_ft_head=base_lr_ft_head,
             base_lr_ft_backbone=base_lr_ft_backbone,
-            num_workers=2,
+            num_workers=num_workers,
             early_stop_patience=5,
             scheduler_patience=2,
             use_balanced_sampler=use_balanced_sampler,
             freeze_bn_after_warmup=freeze_bn,
+            resume=resume,
+            use_amp=use_amp,
         )
 
 
@@ -976,9 +1045,22 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--country", required=True)
     parser.add_argument("--data-root", default="/")
+    parser.add_argument("--organs", default="", help="逗号分隔的器官子集，例如: leaf,fruit")
+    parser.add_argument("--bs", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--resume", type=int, default=1)
+    parser.add_argument("--amp", type=int, default=1)
     args = parser.parse_args()
 
-    train_all_organs(args.csv, args.out, args.country, args.data_root)
+    organs = [o.strip() for o in args.organs.split(",") if o.strip()] if args.organs else None
+    train_all_organs(
+        args.csv, args.out, args.country, args.data_root,
+        organs=organs,
+        global_bs=args.bs,
+        global_num_workers=args.num_workers,
+        resume=bool(args.resume),
+        use_amp=bool(args.amp),
+    )
 
 
 if __name__ == "__main__":
