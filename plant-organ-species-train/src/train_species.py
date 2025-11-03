@@ -179,10 +179,10 @@ current_organ = None   # 仅用于评估函数内取 organ
 
 # 器官自适应配置
 ORGAN_SPEC = {
-    "flower": {"img_size": 448, "epochs_head": 4, "epochs_ft": 20, "tta": True},
-    "leaf":   {"img_size": 512, "epochs_head": 3, "epochs_ft": 30,  "tta": True},
-    "fruit":  {"img_size": 512, "epochs_head": 5, "epochs_ft": 26,  "tta": True},
-    "bark":   {"img_size": 512, "epochs_head": 5, "epochs_ft": 20,  "tta": True},
+    "flower": {"img_size": 448, "epochs_head": 4, "epochs_ft": 40, "tta": True},
+    "leaf":   {"img_size": 512, "epochs_head": 5, "epochs_ft": 60,  "tta": True},
+    "fruit":  {"img_size": 512, "epochs_head": 5, "epochs_ft": 50,  "tta": True},
+    "bark":   {"img_size": 512, "epochs_head": 5, "epochs_ft": 30,  "tta": True},
 }
 
 # >>> 新增：控制 warm-up 是否使用训练增强（而不是验证增强）
@@ -593,6 +593,7 @@ def train_one_species_model_for_organ(
     ckpt_dir = OUT_DIR / "checkpoints" / organ
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     last_state_path = ckpt_dir / "last_state.pt"
+    resume_has_ckpt = (resume and last_state_path.exists())
 
     # ★★★ 关键改动2：使用 NEW 的切分逻辑，保证 train/val 全覆盖
     tr_df, te_df = _load_fixed_split_or_fallback_NEW(
@@ -683,52 +684,55 @@ def train_one_species_model_for_organ(
 
 
     # ===== A) Warmup（只训头） =====
-    for p in model.parameters(): p.requires_grad = False
-    if organ == "flower":
-        for p in model.classifier[2].parameters(): p.requires_grad = True
-    elif organ == "leaf":
-        for p in model.classifier[2].parameters(): p.requires_grad = True
-    elif organ == "fruit":
-        for p in model.classifier[1].parameters(): p.requires_grad = True
-    elif organ == "bark":
-        for p in model.classifier[2].parameters(): p.requires_grad = True
+    if not resume_has_ckpt:
+        for p in model.parameters(): p.requires_grad = False
+        if organ == "flower":
+            for p in model.classifier[2].parameters(): p.requires_grad = True
+        elif organ == "leaf":
+            for p in model.classifier[2].parameters(): p.requires_grad = True
+        elif organ == "fruit":
+            for p in model.classifier[1].parameters(): p.requires_grad = True
+        elif organ == "bark":
+            for p in model.classifier[2].parameters(): p.requires_grad = True
 
-    model = model.to(DEVICE)
-    crit_warmup = nn.CrossEntropyLoss(label_smoothing=0.05)
-    # >>> 改：warm-up 选择使用 train_tf 或 val_tf
-    warmup_tf = (TRAIN_TF_REGISTRY[organ] if WARMUP_USES_TRAIN_TF.get(organ, False)
-                else VAL_TF_REGISTRY[organ])
+        model = model.to(DEVICE)
+        crit_warmup = nn.CrossEntropyLoss(label_smoothing=0.05)
+        # >>> 改：warm-up 选择使用 train_tf 或 val_tf
+        warmup_tf = (TRAIN_TF_REGISTRY[organ] if WARMUP_USES_TRAIN_TF.get(organ, False)
+                    else VAL_TF_REGISTRY[organ])
 
-    warmup_loader = DataLoader(
-        BasicImageDatasetNEW(tr_df, COL_IMAGE, "__species_local__", local_lookup, warmup_tf),
-        batch_size=bs, shuffle=True, num_workers=num_workers, pin_memory=True, 
-        collate_fn=drop_corrupt_collate
-    )
-    opt_head = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=base_lr_head)
+        warmup_loader = DataLoader(
+            BasicImageDatasetNEW(tr_df, COL_IMAGE, "__species_local__", local_lookup, warmup_tf),
+            batch_size=bs, shuffle=True, num_workers=num_workers, pin_memory=True, 
+            collate_fn=drop_corrupt_collate
+        )
+        opt_head = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=base_lr_head)
 
-    # Sanity check：输出维度
-    tmp_loader = DataLoader(
-        BasicImageDatasetNEW(tr_df.sample(min(8, len(tr_df))), COL_IMAGE, "__species_local__", local_lookup, VAL_TF_REGISTRY[organ]),
-        batch_size=min(8, bs), shuffle=True, num_workers=0, collate_fn=drop_corrupt_collate
-    )
-    x0, y0, _ = next(iter(tmp_loader))
-    x0, y0 = x0.to(DEVICE), y0.to(DEVICE)
-    with torch.no_grad():
-        logits0 = model(x0)
-    assert logits0.shape[1] == num_classes, f"[{organ}] 头部维度不等于类数：{logits0.shape[1]} vs {num_classes}"
+        # Sanity check：输出维度
+        tmp_loader = DataLoader(
+            BasicImageDatasetNEW(tr_df.sample(min(8, len(tr_df))), COL_IMAGE, "__species_local__", local_lookup, VAL_TF_REGISTRY[organ]),
+            batch_size=min(8, bs), shuffle=True, num_workers=0, collate_fn=drop_corrupt_collate
+        )
+        x0, y0, _ = next(iter(tmp_loader))
+        x0, y0 = x0.to(DEVICE), y0.to(DEVICE)
+        with torch.no_grad():
+            logits0 = model(x0)
+        assert logits0.shape[1] == num_classes, f"[{organ}] 头部维度不等于类数：{logits0.shape[1]} vs {num_classes}"
 
-    for ep in range(epochs_head):
-        model.train()
-        total, correct = 0, 0
-        for x, y, _ in tqdm(warmup_loader, total=len(warmup_loader), desc=f"[{organ}] Warmup {ep+1}/{epochs_head}"):
-            if x.numel() == 0: continue
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            with autocast(enabled=use_amp):
-                logits = model(x)
-                loss = crit_warmup(logits, y)
-            opt_head.zero_grad(); loss.backward(); opt_head.step()
-            correct += (logits.argmax(1) == y).sum().item(); total += y.size(0)
-        print(f"[{organ}] Warmup {ep+1}/{epochs_head} | Train Acc: {correct/max(1,total):.4f}")
+        for ep in range(epochs_head):
+            model.train()
+            total, correct = 0, 0
+            for x, y, _ in tqdm(warmup_loader, total=len(warmup_loader), desc=f"[{organ}] Warmup {ep+1}/{epochs_head}"):
+                if x.numel() == 0: continue
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                with autocast(enabled=use_amp):
+                    logits = model(x)
+                    loss = crit_warmup(logits, y)
+                opt_head.zero_grad(); loss.backward(); opt_head.step()
+                correct += (logits.argmax(1) == y).sum().item(); total += y.size(0)
+            print(f"[{organ}] Warmup {ep+1}/{epochs_head} | Train Acc: {correct/max(1,total):.4f}")
+    else:
+        print(f"[{organ}] 检测到断点，跳过 warmup，直接进入微调")
 
     # BN 冻结（小 batch 推荐）
     if freeze_bn_after_warmup:
@@ -1006,13 +1010,13 @@ def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str 
             continue
 
         if organ == "flower":
-            bs = 48; base_lr_ft_head=3e-4; base_lr_ft_backbone=2e-5 ; use_balanced_sampler= True ; freeze_bn = True
+            bs = 72; base_lr_ft_head=3e-4; base_lr_ft_backbone=2e-5 ; use_balanced_sampler= True ; freeze_bn = True
         elif organ == "leaf":
-            bs = 48; base_lr_ft_head=3e-4; base_lr_ft_backbone = 3e-5; use_balanced_sampler= False ; freeze_bn = False
+            bs = 72; base_lr_ft_head=3e-4; base_lr_ft_backbone = 3e-5; use_balanced_sampler= False ; freeze_bn = False
         elif organ == "fruit":
-            bs = 40; base_lr_ft_head=3e-4; base_lr_ft_backbone=3e-5; use_balanced_sampler= True ; freeze_bn = True
+            bs = 60; base_lr_ft_head=3e-4; base_lr_ft_backbone=3e-5; use_balanced_sampler= True ; freeze_bn = True
         elif organ == "bark":
-            bs = 40; base_lr_ft_head=1e-3; base_lr_ft_backbone = 5e-5;use_balanced_sampler= True ; freeze_bn = True
+            bs = 60; base_lr_ft_head=1e-3; base_lr_ft_backbone = 5e-5;use_balanced_sampler= True ; freeze_bn = True
 
         if global_bs is not None:
             bs = global_bs
