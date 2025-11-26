@@ -50,12 +50,13 @@ from torchvision import transforms
 from PIL import Image
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, balanced_accuracy_score, confusion_matrix, classification_report
+from sklearn.metrics import f1_score, classification_report
 
 import timm
 from tqdm import tqdm
 from timm.utils import ModelEmaV2
 from torch.cuda.amp import autocast, GradScaler
+
 
 # 记录每个器官的验证变换（评估/训练口径严格对齐）
 TRAIN_TF_REGISTRY = {}
@@ -181,8 +182,8 @@ current_organ = None   # 仅用于评估函数内取 organ
 ORGAN_SPEC = {
     "flower": {"img_size": 448, "epochs_head": 4, "epochs_ft": 40, "tta": True},
     "leaf":   {"img_size": 512, "epochs_head": 5, "epochs_ft": 60,  "tta": True},
-    "fruit":  {"img_size": 512, "epochs_head": 5, "epochs_ft": 50,  "tta": True},
-    "bark":   {"img_size": 512, "epochs_head": 5, "epochs_ft": 30,  "tta": True},
+    "fruit":  {"img_size": 512, "epochs_head": 8, "epochs_ft": 80,  "tta": True},  # 大幅增加 warmup 和微调轮数
+    "bark":   {"img_size": 512, "epochs_head": 6, "epochs_ft": 50,  "tta": True},  # 增加 warmup 和微调轮数
 }
 
 # >>> 新增：控制 warm-up 是否使用训练增强（而不是验证增强）
@@ -197,13 +198,12 @@ def make_species_transforms(organ: str, img_size: int = 512):
     organ = organ.lower()
     if organ == 'bark':
         train_tf = transforms.Compose([
-            transforms.RandomResizedCrop(img_size, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomApply([transforms.ColorJitter(0.02,0.02,0.02,0.005)], p=0.5),
-            #transforms.RandomGrayscale(p=0.10),
-            #transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
-            #transforms.RandomPerspective(distortion_scale=0.05, p=0.05),
+            transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0), ratio=(0.92, 1.08)),  # 增加裁剪范围
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=3),  # 添加轻微旋转
+            transforms.RandomApply([transforms.ColorJitter(0.05,0.05,0.05,0.01)], p=0.4),  # 增强 ColorJitter
             transforms.ToTensor(),
+            transforms.RandomErasing(p=0.10, scale=(0.02, 0.06), ratio=(0.3, 3.3)),  # 添加 RandomErasing
             transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
         ])
         val_tf = transforms.Compose([
@@ -230,12 +230,12 @@ def make_species_transforms(organ: str, img_size: int = 512):
         ])
     elif organ == 'fruit':
         train_tf = transforms.Compose([
-            transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0), ratio=(0.95, 1.05)),
+            transforms.RandomResizedCrop(img_size, scale=(0.90, 1.0), ratio=(0.97, 1.03)),  # 进一步保守：几乎不裁剪
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),
-            transforms.RandomApply([transforms.ColorJitter(0.1,0.1,0.1,0.03)], p=0.5),
+            transforms.RandomRotation(degrees=3),  # 进一步降低旋转：5° → 3°
+            transforms.RandomApply([transforms.ColorJitter(0.05,0.05,0.05,0.01)], p=0.3),  # 进一步降低：强度 0.08→0.05，概率 0.4→0.3
             transforms.ToTensor(),
-            transforms.RandomErasing(p=0.15, scale=(0.02, 0.08), ratio=(0.3, 3.3)),
+            transforms.RandomErasing(p=0.08, scale=(0.02, 0.06), ratio=(0.3, 3.3)),  # 进一步降低：概率 0.12→0.08，scale 上限 0.08→0.06
             transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
         ])
         val_tf = transforms.Compose([
@@ -286,7 +286,7 @@ def get_backbone_for_organ(organ: str, num_classes: int):
         weights = EfficientNet_V2_S_Weights.IMAGENET1K_V1
         model   = models.efficientnet_v2_s(weights=weights)
         in_feat = model.classifier[1].in_features
-        model.classifier[1] = nn.Sequential(nn.Dropout(0.30), nn.Linear(in_feat, num_classes))
+        model.classifier[1] = nn.Sequential(nn.Dropout(0.35), nn.Linear(in_feat, num_classes))  # 降低 dropout: 0.50 → 0.35
 
     elif organ == "bark":
         weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1
@@ -629,7 +629,7 @@ def train_one_species_model_for_organ(
     if use_balanced_sampler:
         if organ == "fruit":
             # 使用 1/sqrt(freq) 权重，更稳
-            freq_series = tr_df["__species_local__"].value_counts().sort_index()
+            '''freq_series = tr_df["__species_local__"].value_counts().sort_index()
             freq_vec = freq_series.reindex(range(num_classes), fill_value=1).values.astype(float)
             class_weights = 1.0 / np.sqrt(np.maximum(freq_vec, 1.0))
             sample_w = tr_df["__species_local__"].map(lambda i: class_weights[int(i)]).astype(float).values
@@ -637,7 +637,22 @@ def train_one_species_model_for_organ(
                 weights=torch.as_tensor(sample_w, dtype=torch.double),
                 num_samples=len(sample_w),
                 replacement=True
+            )'''
+
+            freq_series = tr_df["__species_local__"].value_counts().sort_index()
+            freq_vec = freq_series.reindex(range(num_classes), fill_value=1).astype(float).values
+            alpha = 0.3      # 温和程度（0.25~0.35 区间都可）
+            tau   = 10.0     # 平滑，避免极端权重
+            class_w = (freq_vec + tau) ** (-alpha)
+            class_w = class_w / class_w.mean()                  # 归一到均值=1
+            class_w = np.clip(class_w, 0.25, 4.0)               # 截断避免过度上采样/下采样
+            sample_w = tr_df["__species_local__"].map(lambda i: class_w[int(i)]).astype(float).values
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=torch.as_tensor(sample_w, dtype=torch.double),
+                num_samples=len(sample_w),
+                replacement=True
             )
+
         else:
             weights = tr_df["__species_local__"].map(lambda i: class_w[int(i)].item()).astype(float).values
             sampler = torch.utils.data.WeightedRandomSampler(
@@ -645,20 +660,46 @@ def train_one_species_model_for_organ(
                 num_samples=len(weights),
                 replacement=True
             )
-        tr_ld = torch.utils.data.DataLoader(
+
+        # 统一的 DataLoader 参数（把你现有的 dataset/bs/num_workers 原样带入）
+        common_loader_kwargs = dict(
+            num_workers=num_workers,          # 2~4 起步更稳
+            pin_memory=True,                  # 继续开 pin（利于异步拷贝）
+            #pin_memory_device='cpu',          # ⬅️ 关键：钉死在 CPU，避免在 pin 阶段携带 CUDA 目标导致并发涌入
+            persistent_workers=True,          # 减少反复 fork 带来的额外开销
+            prefetch_factor=1,                # ⬅️ 降低并行在途批次数（默认 2 容易顶峰）
+            collate_fn=drop_corrupt_collate,
+        )
+        
+        '''tr_ld = torch.utils.data.DataLoader(
             tr_ds, batch_size=bs, sampler=sampler,
             num_workers=num_workers, pin_memory=True, persistent_workers=False,
-            collate_fn=drop_corrupt_collate)
-    else:
+            collate_fn=drop_corrupt_collate)'''
         tr_ld = torch.utils.data.DataLoader(
+            tr_ds, batch_size=bs, sampler=sampler, **common_loader_kwargs
+        )
+    else:
+        '''tr_ld = torch.utils.data.DataLoader(
             tr_ds, batch_size=bs, shuffle=True,
             num_workers=num_workers, pin_memory=True, persistent_workers=False,
-            collate_fn=drop_corrupt_collate)
+            collate_fn=drop_corrupt_collate)'''
+        tr_ld = torch.utils.data.DataLoader(
+            tr_ds, batch_size=bs, shuffle=True, **common_loader_kwargs
+        )
 
-    te_ld = torch.utils.data.DataLoader(
+    '''te_ld = torch.utils.data.DataLoader(
         te_ds, batch_size=bs, shuffle=False,
         num_workers=max(1, num_workers//2), pin_memory=True, persistent_workers=False,
-        collate_fn=drop_corrupt_collate)
+        collate_fn=drop_corrupt_collate)'''
+
+        # 验证集
+    te_ld = DataLoader(
+        te_ds, batch_size=bs, shuffle=False,
+        num_workers=max(1, num_workers//2),
+        pin_memory=True, #pin_memory_device='cpu',
+        persistent_workers=True, prefetch_factor=1,
+        collate_fn=drop_corrupt_collate
+    )
 
     # 损失 & 训练两阶段（与你原脚本一致，这里略）……
     # 你原有的 Warmup / freeze BN / Finetune / EMA / 评估代码块直接保留即可
@@ -673,8 +714,8 @@ def train_one_species_model_for_organ(
     organ_cfg = {
         "leaf":   {"mixup_alpha": 0.2, "label_smoothing": 0.02},
         "flower": {"mixup_alpha": 0.2, "label_smoothing": 0.02},
-        "fruit":  {"mixup_alpha": 0.1, "label_smoothing": 0.02},
-        "bark":   {"mixup_alpha": 0.0, "label_smoothing": 0.00},  # bark 关闭 mixup（你前文已做，这里保留）
+        "fruit":  {"mixup_alpha": 0.10, "label_smoothing": 0.01},  # 降低 mixup 和 label_smoothing，避免过度正则化
+        "bark":   {"mixup_alpha": 0.12, "label_smoothing": 0.015},  # 启用 mixup 和 label_smoothing
     }
     cfg = organ_cfg.get(organ, {"mixup_alpha":0.2, "label_smoothing":0.02})
     mixup_alpha = cfg["mixup_alpha"]
@@ -696,15 +737,24 @@ def train_one_species_model_for_organ(
             for p in model.classifier[2].parameters(): p.requires_grad = True
 
         model = model.to(DEVICE)
-        crit_warmup = nn.CrossEntropyLoss(label_smoothing=0.05)
+        # fruit 在 warmup 阶段使用更小的 label smoothing，避免过度平滑
+        crit_warmup = nn.CrossEntropyLoss(label_smoothing=0.02 if organ == "fruit" else 0.05)
         # >>> 改：warm-up 选择使用 train_tf 或 val_tf
-        warmup_tf = (TRAIN_TF_REGISTRY[organ] if WARMUP_USES_TRAIN_TF.get(organ, False)
-                    else VAL_TF_REGISTRY[organ])
+        # fruit 强制使用验证增强进行 warmup，更稳定
+        if organ == "fruit":
+            warmup_tf = VAL_TF_REGISTRY[organ]  # fruit 强制使用验证增强
+        else:
+            warmup_tf = (TRAIN_TF_REGISTRY[organ] if WARMUP_USES_TRAIN_TF.get(organ, False)
+                        else VAL_TF_REGISTRY[organ])
 
-        warmup_loader = DataLoader(
+        '''warmup_loader = DataLoader(
             BasicImageDatasetNEW(tr_df, COL_IMAGE, "__species_local__", local_lookup, warmup_tf),
             batch_size=bs, shuffle=True, num_workers=num_workers, pin_memory=True, 
             collate_fn=drop_corrupt_collate
+        )'''
+        warmup_loader = DataLoader(
+            BasicImageDatasetNEW(tr_df, COL_IMAGE, "__species_local__", local_lookup, warmup_tf),
+            batch_size=bs, shuffle=True, **common_loader_kwargs
         )
         opt_head = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=base_lr_head)
 
@@ -719,16 +769,27 @@ def train_one_species_model_for_organ(
             logits0 = model(x0)
         assert logits0.shape[1] == num_classes, f"[{organ}] 头部维度不等于类数：{logits0.shape[1]} vs {num_classes}"
 
+        # fruit 使用更小的 warmup 学习率
+        warmup_lr = base_lr_head * (0.5 if organ == "fruit" else 1.0)  # fruit 使用一半的学习率
+        for pg in opt_head.param_groups:
+            pg['lr'] = warmup_lr
+        
         for ep in range(epochs_head):
             model.train()
             total, correct = 0, 0
             for x, y, _ in tqdm(warmup_loader, total=len(warmup_loader), desc=f"[{organ}] Warmup {ep+1}/{epochs_head}"):
                 if x.numel() == 0: continue
-                x, y = x.to(DEVICE), y.to(DEVICE)
+                #x, y = x.to(DEVICE), y.to(DEVICE)
+                x = x.to(DEVICE, non_blocking=True)
+                y = y.to(DEVICE, non_blocking=True)
                 with autocast(enabled=use_amp):
                     logits = model(x)
                     loss = crit_warmup(logits, y)
-                opt_head.zero_grad(); loss.backward(); opt_head.step()
+                opt_head.zero_grad(); loss.backward()
+                # fruit 使用梯度裁剪，避免梯度爆炸
+                if organ == "fruit":
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                opt_head.step()
                 correct += (logits.argmax(1) == y).sum().item(); total += y.size(0)
             print(f"[{organ}] Warmup {ep+1}/{epochs_head} | Train Acc: {correct/max(1,total):.4f}")
     else:
@@ -753,7 +814,7 @@ def train_one_species_model_for_organ(
         for p in getattr(model, "classifier").parameters(): p.requires_grad = True
     elif organ == "fruit":
         for name, p in model.named_parameters():
-            if name.startswith(("features.5","features.6","features.7","classifier")): p.requires_grad = True
+            if name.startswith(("features.6","features.7","classifier")): p.requires_grad = True
         for p in model.classifier.parameters(): p.requires_grad = True
 
     params_head, params_backbone = [], []
@@ -780,6 +841,12 @@ def train_one_species_model_for_organ(
     if organ in ("bark","flower"):
         param_groups = build_llrd_for_convnext(model, base_lr_ft_backbone, base_lr_ft_head)
         opt_ft = torch.optim.AdamW(param_groups)
+    elif organ == "fruit":
+        # fruit 使用更小的 weight decay，避免过度正则化
+        opt_ft = torch.optim.AdamW([
+            {"params": params_backbone, "lr": base_lr_ft_backbone, "weight_decay": 3e-4},  # 降低 weight decay: 7e-4→3e-4
+            {"params": params_head,     "lr": base_lr_ft_head,     "weight_decay": 3e-4},
+        ])
     else:
         opt_ft = torch.optim.AdamW([
             {"params": params_backbone, "lr": base_lr_ft_backbone, "weight_decay": 3e-4},
@@ -797,8 +864,13 @@ def train_one_species_model_for_organ(
         if 'initial_lr' not in pg:
             pg['initial_lr'] = pg['lr']
 
-    # warmup 轮数（按微调总轮数的 10%，至少 1 轮）
-    warmup_epochs = max(1, int(0.10 * epochs_ft))
+    # warmup 轮数（fruit 和 bark 需要更长的 warmup）
+    if organ == "fruit":
+        warmup_epochs = max(8, int(0.25 * epochs_ft))  # fruit: 25% 或至少 8 轮（更长的 warmup 避免早期过拟合）
+    elif organ == "bark":
+        warmup_epochs = max(4, int(0.20 * epochs_ft))  # bark: 20% 或至少 4 轮（更保守）
+    else:
+        warmup_epochs = max(1, int(0.10 * epochs_ft))  # 其他器官：10% 或至少 1 轮
 
     # 余弦退火（warmup 结束后再进入余弦阶段）
     # 注意：T_max 设为 “剩余微调轮数”，eta_min 取一个 base_lr 的 1%~10%（可自行微调）
@@ -859,10 +931,20 @@ def train_one_species_model_for_organ(
             opt_ft.zero_grad()
             if use_amp:
                 scaler.scale(loss).backward()
-                scaler.step(opt_ft)
+                # fruit 使用梯度裁剪
+                if organ == "fruit":
+                    scaler.unscale_(opt_ft)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(opt_ft)
+                else:
+                    scaler.step(opt_ft)
                 scaler.update()
             else:
-                loss.backward(); opt_ft.step()
+                loss.backward()
+                # fruit 使用梯度裁剪
+                if organ == "fruit":
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                opt_ft.step()
             if use_ema:
                 with torch.no_grad():
                     for p_e, p in zip(ema_model.parameters(), model.parameters()):
@@ -875,7 +957,11 @@ def train_one_species_model_for_organ(
         # === 每轮末尾做 LR 调度 ===
         if ep < warmup_epochs:
             # 线性 warmup：从 0 → initial_lr（按 param group 单独线性升温）
-            scale = float(ep + 1) / warmup_epochs
+            # fruit 使用更平滑的 warmup（平方根升温，更保守）
+            if organ == "fruit":
+                scale = np.sqrt(float(ep + 1) / warmup_epochs)  # 平方根升温，更平滑
+            else:
+                scale = float(ep + 1) / warmup_epochs  # 线性升温
             for pg in opt_ft.param_groups:
                 pg['lr'] = pg['initial_lr'] * scale
         else:
@@ -1014,9 +1100,9 @@ def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str 
         elif organ == "leaf":
             bs = 72; base_lr_ft_head=3e-4; base_lr_ft_backbone = 3e-5; use_balanced_sampler= False ; freeze_bn = False
         elif organ == "fruit":
-            bs = 60; base_lr_ft_head=3e-4; base_lr_ft_backbone=3e-5; use_balanced_sampler= True ; freeze_bn = True
+            bs = 60; base_lr_ft_head=2e-5; base_lr_ft_backbone=3e-6; use_balanced_sampler= True ; freeze_bn = False  # 进一步大幅降低学习率：head 5e-5→2e-5, backbone 8e-6→3e-6
         elif organ == "bark":
-            bs = 60; base_lr_ft_head=1e-3; base_lr_ft_backbone = 5e-5;use_balanced_sampler= True ; freeze_bn = True
+            bs = 60; base_lr_ft_head=2e-4; base_lr_ft_backbone=3e-5; use_balanced_sampler= True ; freeze_bn = True  # 大幅降低 head lr: 1e-3→2e-4, backbone 5e-5→3e-5
 
         if global_bs is not None:
             bs = global_bs
@@ -1034,7 +1120,7 @@ def train_all_organs(csv_path: str, base_out: str, country: str, data_root: str 
             base_lr_ft_head=base_lr_ft_head,
             base_lr_ft_backbone=base_lr_ft_backbone,
             num_workers=num_workers,
-            early_stop_patience=5,
+            early_stop_patience=8 if organ in ["fruit", "bark"] else 5,  # fruit 和 bark 需要更多耐心
             scheduler_patience=2,
             use_balanced_sampler=use_balanced_sampler,
             freeze_bn_after_warmup=freeze_bn,

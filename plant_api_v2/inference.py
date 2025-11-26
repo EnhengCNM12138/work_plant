@@ -19,6 +19,7 @@ from torchvision.models import (
     ConvNeXt_Tiny_Weights,
     EfficientNet_B0_Weights,
     MobileNet_V3_Small_Weights,
+    EfficientNet_V2_S_Weights,
 )
 import timm
 
@@ -38,6 +39,8 @@ id2organ = None
 species_models = {}
 species_transforms = {}
 species_id2label = {}
+species_prior_log = {}
+species_tau_T = {}
 
 # 器官分类器模型类（来自organ_test.ipynb）
 class OrgansHier(nn.Module):
@@ -67,7 +70,7 @@ class OrgansHier(nn.Module):
 
 def build_eval_tf(organ: str, img_size: int) -> transforms.Compose:
     return transforms.Compose([
-        transforms.Resize(int(img_size * 1.05)),
+        transforms.Resize(int(img_size * 1.14)),
         transforms.CenterCrop(img_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225))
@@ -75,7 +78,9 @@ def build_eval_tf(organ: str, img_size: int) -> transforms.Compose:
 
 def get_infer_backbone_for_organ(organ: str, num_classes: int) -> Tuple[nn.Module, transforms.Compose, int]:
     organ = str(organ).lower().strip()
-    img_size = 384
+    # 与训练一致的输入分辨率
+    organ_img_size = {"leaf": 512, "fruit": 512, "flower": 448, "bark": 512}
+    img_size = organ_img_size.get(organ, 384)
 
     if organ == "flower":
         weights = ConvNeXt_Small_Weights.IMAGENET1K_V1
@@ -84,14 +89,16 @@ def get_infer_backbone_for_organ(organ: str, num_classes: int) -> Tuple[nn.Modul
         model.classifier[2] = nn.Sequential(nn.Dropout(0.30), nn.Linear(in_feat, num_classes))
 
     elif organ == "leaf":
-        weights = ResNet50_Weights.IMAGENET1K_V1
-        model   = models.resnet50(weights=weights)
-        in_feat = model.fc.in_features
-        model.fc = nn.Sequential(nn.Dropout(0.30), nn.Linear(in_feat, num_classes))
+        # 训练端已切换为 ConvNeXt-Small
+        weights = ConvNeXt_Small_Weights.IMAGENET1K_V1
+        model   = models.convnext_small(weights=weights)
+        in_feat = model.classifier[2].in_features
+        model.classifier[2] = nn.Sequential(nn.Dropout(0.30), nn.Linear(in_feat, num_classes))
 
     elif organ == "fruit":
-        weights = EfficientNet_B0_Weights.IMAGENET1K_V1
-        model   = models.efficientnet_b0(weights=weights)
+        # 训练端已切换为 EfficientNetV2-S
+        weights = EfficientNet_V2_S_Weights.IMAGENET1K_V1
+        model   = models.efficientnet_v2_s(weights=weights)
         in_feat = model.classifier[1].in_features
         model.classifier[1] = nn.Sequential(nn.Dropout(0.30), nn.Linear(in_feat, num_classes))
 
@@ -193,7 +200,7 @@ def load_species_model_for_organ_cached(organ: str):
         print(f"🔄 加载{organ}物种分类器...")
         
         # 模型文件路径
-        model_path = MODEL_DIR / f"{organ}_species_model.pth"
+        model_path = MODEL_DIR / f"new_{organ}_species_model_full.pth"
         if not model_path.exists():
             raise FileNotFoundError(f"物种分类器模型不存在: {model_path}")
         
@@ -201,7 +208,7 @@ def load_species_model_for_organ_cached(organ: str):
         pack = torch.load(model_path, map_location=DEVICE)
         
         # 从JSON文件获取类别信息
-        map_path = MODEL_DIR / f"species_local_map_{organ}.json"
+        map_path = MODEL_DIR / f"new_species_local_map_{organ}.json"
         if not map_path.exists():
             raise FileNotFoundError(f"映射文件不存在: {map_path}")
         
@@ -225,11 +232,30 @@ def load_species_model_for_organ_cached(organ: str):
         
         # 设置变换
         species_transforms[organ] = val_tfm
+
+        # 载入先验与 tau/T（若缺失则回退默认）
+        prior_path = MODEL_DIR / f"{organ}_prior_log.json"
+        try:
+            if prior_path.exists():
+                vec = json.load(open(prior_path, "r", encoding="utf-8"))
+                species_prior_log[organ] = torch.tensor(vec, dtype=torch.float32, device=DEVICE)
+            else:
+                species_prior_log[organ] = torch.zeros((num_classes,), dtype=torch.float32, device=DEVICE)
+        except Exception:
+            species_prior_log[organ] = torch.zeros((num_classes,), dtype=torch.float32, device=DEVICE)
+
+        tauT_path = MODEL_DIR / "auto_tau_T.json"
+        try:
+            tauT = json.load(open(tauT_path, "r", encoding="utf-8")) if tauT_path.exists() else {}
+        except Exception:
+            tauT = {}
+        default_tauT = {"leaf": [0.0, 1.0], "flower": [0.6, 1.0], "fruit": [0.8, 1.0], "bark": [0.3, 1.0]}
+        species_tau_T[organ] = tauT.get(organ, default_tauT.get(organ, [0.0, 1.0]))
         
         print(f"✅ {organ}物种分类器加载完成")
         return model, val_tfm, species_id2label[organ]
 
-def is_plant_clip(image_path: str) -> bool:
+'''def is_plant_clip(image_path: str) -> bool:
     """使用CLIP判断是否为植物"""
     load_clip_model()
     
@@ -262,8 +288,132 @@ def is_plant_clip(image_path: str) -> bool:
     top_idx = logits.argmax().item()
     top_label = labels[top_idx]
     return top_label == "a photo of a plant"
+'''
+import os
+import torch
+from PIL import Image
+import open_clip
 
-def is_diseased_clip(image_paths: List[str], vote_threshold: float = 0.7) -> bool:
+# 可选：把这两个设成全局缓存，避免每次重复 tokenize / to(DEVICE)
+_CLIP_IS_PLANT_LABELS = None
+_CLIP_IS_PLANT_TEXT_TOKENS = None
+_CLIP_IS_PLANT_PLANT_IDXS = None
+
+
+def _init_is_plant_labels(device):
+    global _CLIP_IS_PLANT_LABELS, _CLIP_IS_PLANT_TEXT_TOKENS, _CLIP_IS_PLANT_PLANT_IDXS
+
+    if _CLIP_IS_PLANT_LABELS is not None:
+        return
+
+    # 1. label 设计：覆盖你选的 A-G 全部类别 + 基础植物形态
+    labels = [
+        # ---- 植物本体 ----
+        "a close-up photo of a green plant leaf",          # 0  叶子特写
+        "a photo of a whole plant in a pot or in soil",    # 1  整株植物
+        "a close-up photo of a flower on a plant",         # 2  花
+        "a photo of a tree or a bush",                     # 3  树 / 灌木
+
+        # ---- 植物产物：水果 / 蔬菜 / 坚果 / 谷物 ----
+        "a photo of fresh fruit such as apples or oranges",              # 4  水果  A
+        "a photo of fresh vegetables such as carrots or tomatoes",       # 5  蔬菜  B
+        "a photo of mixed raw nuts such as walnuts or almonds",          # 6  坚果  C
+        "a photo of raw seeds or grains such as rice wheat or corn",     # 7  种子/谷物 D
+
+
+        # ---- 植物衍生：木材 / 海藻 ----
+        "a photo of stacked logs or cut wood from trees",                # 9  木材  F
+        "a photo of seaweed or algae in water or on rocks",              # 10 海藻  G
+
+        # ---- 明确的非植物对照类 ----
+        "a photo of an animal",                         # 11
+        "an image of a mushroom or fungi, not a plant", 
+        "a photo of a person",                         # 12
+        "a photo of tools or man-made objects",        # 13
+        "a plate of cooked food",                      # 14
+        "a logo or text on a white background",        # 15
+        "a screenshot of a user interface or app",     # 16
+        "a photo of a document or printed text"        # 17
+    ]
+
+    # 哪些 index 视作“植物相关”，这里把 0~10 全部当成植物/植物产物
+    plant_label_idx = list(range(0, 10))
+
+    text_tokens = open_clip.tokenize(labels).to(device)
+
+    _CLIP_IS_PLANT_LABELS = labels
+    _CLIP_IS_PLANT_TEXT_TOKENS = text_tokens
+    _CLIP_IS_PLANT_PLANT_IDXS = plant_label_idx
+
+
+def is_plant_clip(
+    image_path: str,
+    debug: bool = False,
+    prob_threshold: float = 0.28,
+    margin: float = 0.18,
+) -> bool:
+    """
+    使用 CLIP 判断是否为“植物相关”：
+    - 整株植物、叶子、花、树木
+    - 水果、蔬菜、坚果、种子/谷物、蘑菇
+    - 木材、海藻/藻类
+    都算 is_plant = True
+    """
+    load_clip_model()
+
+    if not os.path.exists(image_path):
+        return False
+    if os.path.isdir(image_path):
+        return False
+
+    _init_is_plant_labels(DEVICE)
+    labels = _CLIP_IS_PLANT_LABELS
+    text_tokens = _CLIP_IS_PLANT_TEXT_TOKENS
+    plant_label_idx = _CLIP_IS_PLANT_PLANT_IDXS
+
+    with torch.no_grad():
+        image = preprocess(Image.open(image_path).convert("RGB")).unsqueeze(0).to(DEVICE)
+
+        img_feat = clip_model.encode_image(image)
+        txt_feat = clip_model.encode_text(text_tokens)
+
+        img_feat /= img_feat.norm(dim=-1, keepdim=True)
+        txt_feat /= txt_feat.norm(dim=-1, keepdim=True)
+
+        probs = (100.0 * img_feat @ txt_feat.T).softmax(dim=-1).squeeze()  # [num_labels]
+
+    # 全局 argmax（CLIP 最自信的类别）
+    top_idx = probs.argmax().item()
+    top_label = labels[top_idx]
+    top_prob = probs[top_idx].item()
+
+    # 植物相关类别中的最大概率
+    plant_probs = probs[plant_label_idx]
+    best_plant_prob, best_plant_rel_idx = plant_probs.max(dim=0)
+    best_plant_prob = best_plant_prob.item()
+    best_plant_label = labels[plant_label_idx[best_plant_rel_idx.item()]]
+
+    if debug:
+        print(f"[CLIP is_plant] top        = {top_label} ({top_prob:.4f})")
+        print(f"[CLIP is_plant] best_plant = {best_plant_label} ({best_plant_prob:.4f})")
+
+        # 也可以打印一整个排序看一眼
+        sorted_idx = torch.argsort(probs, descending=True)
+        print("Top-5 probs:")
+        for i in sorted_idx[:5]:
+            print(f"  {labels[i]}: {probs[i].item():.4f}")
+
+    # 判定策略：
+    # 1) 植物相关 label 的最大概率 > prob_threshold（默认 0.28）
+    # 2) 并且不比全局 argmax 差太多（差值不超过 margin，默认 0.18）
+    #    例：top 是 “cooked food” 0.40，但 “vegetables” 也有 0.35，则仍当成植物
+    is_plant = (best_plant_prob > prob_threshold) and (best_plant_prob >= top_prob - margin)
+
+    return is_plant
+
+
+
+'''def is_diseased_clip(image_paths: List[str], vote_threshold: float = 0.7) -> bool:
     """使用CLIP判断是否有病虫害"""
     load_clip_model()
     
@@ -313,7 +463,141 @@ def is_diseased_clip(image_paths: List[str], vote_threshold: float = 0.7) -> boo
             total += 1
             votes += (logit.argmax().item() == 1)
     
-    return (votes / total) >= vote_threshold
+    return (votes / total) >= vote_threshold'''
+
+'''def is_diseased_clip(image_paths, vote_threshold: float = 0.7):
+    load_clip_model()
+    healthy_prompts = [
+        "The leaves of healthy plants are usually bright green",
+        "The leaves of healthy plants are usually full and shiny, with no obvious signs of disease or insect damage on the leaf surface",
+        "Healthy plants usually have strong, straight stems that are able to support the weight of the plant",
+        "Healthy plants will show vigorous growth, including sprouting new leaves, extending branches and blooming flowers",
+        "Healthy plant leaves have clear veins and are not excessively curled or wrinkled",
+        "A healthy plant has bright flowers with intact petals and no wilting, falling off, or diseased spots",
+        "The fruit of a healthy plant is full and has no cracks, rot or lesions. The fruit skin is normal color"
+    ]
+    diseased_prompts = [
+        "Unhealthy plant leaves or flowers will have spots or patches of different shapes, sizes and colors, such as round, oval, polygonal, wheel-shaped",
+        "Unhealthy plants have curled, shrunken, twisted leaves and flowers, and misshapen and stunted flowers",
+        "Tumor-like protrusions appear on the stem, such as rose cancer, and swelling occurs",
+        "Soft rot, wet rot or dry rot on the stem",
+        "Unhealthy plants may have holes, nicks, or signs of being eaten on their leaves and petals",
+        "Unhealthy plants may have visible insects, such as aphids and spider mites. Some pests will leave spider web-like silk",
+        "Leaves lose their normal green color, show yellowing symptoms, partially or completely die, and appear brown or black",
+        "The petals may appear water-soaked, rotten, softened, or even completely rotten."
+    ]
+
+    feats = []
+    for p in image_paths:
+        try:
+            img = preprocess(Image.open(p).convert('RGB')).unsqueeze(0).to(DEVICE)
+            with torch.no_grad():
+                f = clip_model.encode_image(img)
+                feats.append(f / f.norm(dim=-1, keepdim=True))
+        except Exception as e:
+            print("加载失败:", p, e)
+
+    if not feats:
+        print("没有有效图片")
+        return False
+
+    img_feat = torch.mean(torch.stack(feats), dim=0, keepdim=True)
+    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+
+    votes, total = 0, 0
+    diseased_probs = []
+
+    with torch.no_grad():
+        for i, (hp, dp) in enumerate(zip(healthy_prompts, diseased_prompts)):
+            toks = open_clip.tokenize([hp, dp]).to(DEVICE)
+            txt_feat = clip_model.encode_text(toks)
+            txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+            logit = (100 * img_feat @ txt_feat.T).softmax(dim=-1).squeeze()
+            p_h, p_d = logit[0].item(), logit[1].item()
+            total += 1
+            if p_d > p_h:
+                votes += 1
+            diseased_probs.append(p_d)
+            print(f"Pair {i+1}: P_healthy={p_h:.3f}, P_diseased={p_d:.3f}, vote={'D' if p_d>p_h else 'H'}")
+
+    print(f"votes={votes}/{total}, avg P_diseased={sum(diseased_probs)/len(diseased_probs):.3f}")
+    is_d = (votes / total) >= vote_threshold
+    print("Final is_diseased =", is_d)
+    return is_d'''
+
+def is_diseased_clip(
+    image_paths: List[str],
+    vote_threshold: float = 0.75,   # 票数比例阈值，更保守
+    min_avg_prob: float = 0.65,     # 平均病害概率阈值
+    margin: float = 0.20            # 安全边界
+) -> bool:
+    """使用 CLIP 判断是否有病虫害（保守版）"""
+    load_clip_model()
+
+    healthy_prompts = [
+        "The leaves of healthy plants are usually bright green",
+        "The leaves of healthy plants are usually full and shiny, with no obvious signs of disease or insect damage on the leaf surface",
+        "Healthy plants usually have strong, straight stems that are able to support the weight of the plant",
+        "Healthy plants will show vigorous growth, including sprouting new leaves, extending branches and blooming flowers",
+        "Healthy plant leaves have clear veins and are not excessively curled or wrinkled",
+        "A healthy plant has bright flowers with intact petals and no wilting, falling off, or diseased spots",
+        "The fruit of a healthy plant is full and has no cracks, rot or lesions. The fruit skin is normal color"
+    ]
+    diseased_prompts = [
+        "Unhealthy plant leaves or flowers will have spots or patches of different shapes, sizes and colors, such as round, oval, polygonal, wheel-shaped",
+        "Unhealthy plants have curled, shrunken, twisted leaves and flowers, and misshapen and stunted flowers",
+        "Tumor-like protrusions appear on the stem, such as rose cancer, and swelling occurs",
+        "Soft rot, wet rot or dry rot on the stem",
+        "Unhealthy plants may have holes, nicks, or signs of being eaten on their leaves and petals",
+        "Unhealthy plants may have visible insects, such as aphids and spider mites. Some pests will leave spider web-like silk",
+        "Leaves lose their normal green color, show yellowing symptoms, partially or completely die, and appear brown or black",
+        "The petals may appear water-soaked, rotten, softened, or even completely rotten."
+    ]
+
+    feats = []
+    for p in image_paths:
+        try:
+            img = preprocess(Image.open(p).convert('RGB')).unsqueeze(0).to(DEVICE)
+            with torch.no_grad():
+                f = clip_model.encode_image(img)
+                feats.append(f / f.norm(dim=-1, keepdim=True))
+        except Exception as e:
+            print("加载失败:", p, e)
+
+    if not feats:
+        return False
+
+    img_feat = torch.mean(torch.stack(feats), dim=0, keepdim=True)
+    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+
+    diseased_probs = []
+    strong_diseased_votes = 0
+    total_pairs = 0
+
+    with torch.no_grad():
+        for hp, dp in zip(healthy_prompts, diseased_prompts):
+            toks = open_clip.tokenize([hp, dp]).to(DEVICE)
+            txt_feat = clip_model.encode_text(toks)
+            txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+            logit = (100 * img_feat @ txt_feat.T).softmax(dim=-1).squeeze()
+            p_h, p_d = logit[0].item(), logit[1].item()
+            diseased_probs.append(p_d)
+            total_pairs += 1
+
+            # 只有当 P_d 显著大于 P_h 时才算一票
+            if p_d - p_h > margin:
+                strong_diseased_votes += 1
+
+    avg_p_d = sum(diseased_probs) / len(diseased_probs)
+    if total_pairs == 0:
+        return False
+
+    vote_ratio = strong_diseased_votes / total_pairs
+
+    # 同时满足：“强病害票比例”足够高 & “整体病害概率”足够高
+    return (vote_ratio >= vote_threshold) and (avg_p_d >= min_avg_prob)
+
+
 
 @torch.no_grad()
 def organ_predict_topk(
@@ -370,7 +654,19 @@ def species_predict_batch_dict(image_paths: List[str], organ: str) -> List[Dict[
             img = im.convert("RGB")
         xs.append(transform(img))
     batch = torch.stack(xs, dim=0).to(DEVICE)
+
+    # 基础前向 + 水平翻转 TTA
     logits = model(batch)
+    logits = 0.5 * (logits + model(torch.flip(batch, dims=[3])))
+
+    # 先验校正 + 温度缩放
+    tau, T = species_tau_T.get(organ, [0.0, 1.0])
+    prior_log = species_prior_log.get(organ, None)
+    if prior_log is not None and isinstance(prior_log, torch.Tensor) and tau and tau > 0:
+        logits = logits - float(tau) * prior_log.view(1, -1)
+    if T is not None and float(T) != 1.0:
+        logits = logits / float(T)
+
     probs = F.softmax(logits, dim=1).cpu().numpy()  # [B, K_local]
 
     out: List[Dict[str, float]] = []
@@ -541,7 +837,7 @@ def predict_plant_full(image_paths: List[str]) -> Dict:
         # 1) 植物性检测（多数规则）
         is_plant_flags = [is_plant_clip(p) for p in image_paths]
         num_plant = sum(is_plant_flags)
-        if num_plant <= (len(image_paths) // 2):
+        if num_plant == 0:
             return {
                 "code": 200, "msg": "成功",
                 "data": {"is_plant": False, "is_database": False, "plants": [], "is_infected": False}
@@ -623,7 +919,7 @@ def predict_plant_full(image_paths: List[str]) -> Dict:
             }
 
         # 多图：投票 + 平均置信度
-        counter = collections.Counter([s for s in all_top1_species if s != "unknown"])
+        '''counter = collections.Counter([s for s in all_top1_species if s != "unknown"])
         if not counter:
             return {
                 "code": 200, "msg": "成功",
@@ -662,7 +958,61 @@ def predict_plant_full(image_paths: List[str]) -> Dict:
             "code": 500,
             "msg": f"处理失败: {str(e)}",
             "data": {}
+        }'''
+
+        # 多图：改为汇总每张图的 top3 候选 → 全局聚合取 top3
+        # 之前做法：只统计每张图的 top1，可能导致仅返回 1 个物种
+        # 新做法：把每张图的 candidates(top3) 全部累计打分，再取全局 top3
+
+        # 1) 汇总每张图的 top3 候选分数
+        agg_scores = collections.Counter()   # latin_name -> 累计分数
+        species_to_images_all = {}           # 候选物种 -> 相关图片（用于病虫害检测）
+        for r in known_results:
+            for cand in r["candidates"]:  # [{'latin_name':..., 'confidence':...}, ...]
+                name = cand["latin_name"]
+                agg_scores[name] += float(cand["confidence"])
+                species_to_images_all.setdefault(name, []).append(r["path"])
+
+        if not agg_scores:
+            return {
+                "code": 200, "msg": "成功",
+                "data": {"is_plant": True, "is_database": False, "plants": [], "is_infected": False}
+            }
+
+        # 2) 取全局 top3；置信度用“累计分数 / 有效植物图片数”的均值
+        total_imgs = max(len(known_results), 1)
+        topk_global = agg_scores.most_common(3)
+        plants_list = [
+            {"latin_name": name, "confidence": round(float(score) / total_imgs, 4)}
+            for name, score in topk_global
+        ]
+
+        # 3) 病虫害检测仍按全局 top1 的相关图像做（保持你的既有习惯）
+        top1_species = topk_global[0][0]
+        #disease_paths = species_to_images_all.get(top1_species, [])
+        disease_paths = list({p for name,_ in topk_global for p in species_to_images_all.get(name, [])})
+        is_infected = is_diseased_clip(disease_paths, vote_threshold=0.5)
+
+        return {
+            "code": 200, "msg": "成功",
+            "data": {
+                "is_plant": True,
+                "is_database": True,
+                "plants": plants_list,   # ← 多图也返回 top3
+                "is_infected": bool(is_infected)
+            }
         }
+
+    except Exception as e:
+        print(f"❌ 处理失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "code": 500,
+            "msg": f"处理失败: {str(e)}",
+            "data": {}
+        } 
+
 
 # 兼容性函数
 def predict_plant(image_path: str) -> Dict:
