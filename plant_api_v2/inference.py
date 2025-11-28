@@ -22,9 +22,13 @@ from torchvision.models import (
     EfficientNet_V2_S_Weights,
 )
 import timm
+import logging
+
 
 # 设备配置
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+logger = logging.getLogger("plant_api")
+
 
 # 模型路径配置
 MODEL_DIR = Path("./weights")
@@ -174,7 +178,6 @@ def load_organ_classifier():
         model.load_state_dict(pack["state_dict"], strict=False)
         model = model.eval()
         organ_model = model
-        
         # 加载器官标签映射
         organ2id = pack["organ2id"]
         id2organ = {v: k for k, v in organ2id.items()}
@@ -226,7 +229,6 @@ def load_species_model_for_organ_cached(organ: str):
         model.load_state_dict(sd, strict=True)
         model = model.to(DEVICE).eval()
         species_models[organ] = model
-        
         # 加载标签映射：创建从local_id到latin_name的反向映射
         species_id2label[organ] = {v: k for k, v in species_local_map.items()}
         
@@ -289,10 +291,6 @@ def load_species_model_for_organ_cached(organ: str):
     top_label = labels[top_idx]
     return top_label == "a photo of a plant"
 '''
-import os
-import torch
-from PIL import Image
-import open_clip
 
 # 可选：把这两个设成全局缓存，避免每次重复 tokenize / to(DEVICE)
 _CLIP_IS_PLANT_LABELS = None
@@ -411,7 +409,36 @@ def is_plant_clip(
 
     return is_plant
 
+def get_devices_string() -> str:
+    """
+    返回当前模型设备状态的简短字符串，用于 log 一行打印。
+    例如: "clip=cuda:0 | organ=cuda:0 | species(flower)=cuda:0 | species(leaf)=cuda:0"
+    """
+    parts = []
 
+    # CLIP
+    global clip_model
+    if clip_model is not None:
+        parts.append(f"clip={next(clip_model.parameters()).device}")
+    else:
+        parts.append("clip=NOT_LOADED")
+
+    # 器官分类器
+    global organ_model
+    if organ_model is not None:
+        parts.append(f"organ={next(organ_model.parameters()).device}")
+    else:
+        parts.append("organ=NOT_LOADED")
+
+    # 各器官物种模型
+    global species_models
+    if species_models:
+        for organ, m in species_models.items():
+            parts.append(f"species({organ})={next(m.parameters()).device}")
+    else:
+        parts.append("species=EMPTY")
+
+    return " | ".join(parts)
 
 '''def is_diseased_clip(image_paths: List[str], vote_threshold: float = 0.7) -> bool:
     """使用CLIP判断是否有病虫害"""

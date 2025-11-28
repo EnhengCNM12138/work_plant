@@ -9,7 +9,43 @@ from typing import List
 from pydantic import BaseModel, Field
 import os
 
-from inference import predict_plant_full, download_image
+#from inference import predict_plant_full, download_image
+from inference import predict_plant_full, download_image, get_devices_string
+
+import time
+
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+
+
+
+# ===== 日志配置：写到 /var/log/plant_api.log，同时打印到控制台 =====
+logger = logging.getLogger("plant_api")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:  # 避免 uvicorn reload 时重复添加 handler
+    log_path = "./plant_api.log"
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=50 * 1024 * 1024,  # 50MB 自动轮转
+        backupCount=10,
+        encoding="utf-8"
+    )
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # 控制台也打日志（方便你现在看）
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+
 
 app = FastAPI(
     title="植物识别API v2",
@@ -52,9 +88,11 @@ async def predict_from_urls_json(request: URLRequest):
     failed_urls = []
     
     try:
+        t0 = time.time() # 开始时间
         print(f"🔍 接收到 {len(image_urls)} 个URL: {image_urls}")
         
         # 下载所有图片
+        t_dl_start = time.time()               # ★ 下载起点
         for url in image_urls:
             print(f"📥 下载图片: {url}")
             filepath = download_image(url, UPLOAD_DIR)
@@ -64,7 +102,9 @@ async def predict_from_urls_json(request: URLRequest):
             else:
                 failed_urls.append(url)
                 print(f"❌ 下载失败: {url}")
-        
+        t_dl_end = time.time()               # ★ 下载终点
+        print(f"🌐 下载完成: {t_dl_end - t_dl_start:.2f}秒")
+
         if not downloaded_paths:
             return JSONResponse(
                 status_code=400,
@@ -76,10 +116,22 @@ async def predict_from_urls_json(request: URLRequest):
             )
         
         print(f"🔬 开始推理 {len(downloaded_paths)} 张图片...")
-        
-        # 调用推理函数
+
+        t_inf_start = time.time()              # ★ 推理起点
         result = predict_plant_full(downloaded_paths)
-        
+        t_inf_end = time.time()                # ★ 推理结束
+
+        t_end = time.time()
+        devices = get_devices_string()
+        logger.info(
+            "⌚️ [TIMER] /predict(json): "
+            f"download={t_dl_end - t_dl_start:.3f}s, "
+            f"infer={t_inf_end - t_inf_start:.3f}s, "
+            f"other={t_end - t_inf_end + t0 - t0:.3f}s, "
+            f"total={t_end - t0:.3f}s, "
+            f"💾 [DEVICES]:({devices})"
+        )
+
         # 添加下载失败信息
         if failed_urls:
             result["failed_urls"] = failed_urls
@@ -161,9 +213,11 @@ async def predict_from_urls_form(image_urls: List[str] = Form(..., description="
     failed_urls = []
     
     try:
+        t0 = time.time() # 开始时间
         print(f"🔍 接收到 {len(processed_urls)} 个URL: {processed_urls}")
         
         # 下载图片
+        t_dl_start = time.time()
         for url in processed_urls:
             print(f"📥 下载图片: {url}")
             result = download_image(url, UPLOAD_DIR)
@@ -173,6 +227,7 @@ async def predict_from_urls_form(image_urls: List[str] = Form(..., description="
             else:
                 failed_urls.append(url)
                 print(f"❌ 下载失败: {url}")
+        t_dl_end = time.time()
         
         if not downloaded_paths:
             return JSONResponse(
@@ -184,9 +239,22 @@ async def predict_from_urls_form(image_urls: List[str] = Form(..., description="
             )
         
         print(f"🔬 开始推理 {len(downloaded_paths)} 张图片...")
-        
-        # 调用推理函数
+
+        t_inf_start = time.time()
         result = predict_plant_full(downloaded_paths)
+        t_inf_end = time.time()
+
+        t_end = time.time()
+        devices = get_devices_string()
+        logger.info(
+            "⌚️ [TIMER] /predict(json): "
+            f"download={t_dl_end - t_dl_start:.3f}s, "
+            f"infer={t_inf_end - t_inf_start:.3f}s, "
+            f"other={t_end - t_inf_end + t0 - t0:.3f}s, "
+            f"total={t_end - t0:.3f}s, "
+            f"💾 [DEVICES]:({devices})"
+        )
+
         
         # 在结果中添加下载信息
         if failed_urls:
